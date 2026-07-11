@@ -1,0 +1,9 @@
+
+# Portfolio rewrite rules
+RewriteEngine On
+RewriteCond %{HTTP_USER_AGENT} (AhrefsBot|SemrushBot|MJ12bot|DotBot|rogerbot|DataForSeoBot|BLEXBot|serpstatbot|Barkrowler|MegaIndex|GPTBot|ClaudeBot|CCBot|PerplexityBot|Bytespider|Amazonbot|meta-externalagent|Google-Extended|GoogleOther|anthropic-ai|Claude-Web) [NC]
+RewriteRule .* - [F,L]
+RewriteBase /portfolio/
+
+# Custom redirection
+RewriteRule ^gallery$ projects.php [L,R=301]
