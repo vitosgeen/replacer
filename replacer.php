@@ -42,8 +42,10 @@ function print_help() {
     echo "  --mode=<mode>           Replacement mode: string | regex | prepend | append | htaccess-bot-blocker\n";
     echo "  --find=<pattern>        Search string or regex pattern (required for string/regex modes)\n";
     echo "  --replace=<string>      Replacement text or value to add (required for string/regex/prepend/append modes)\n";
-    echo "  --max-depth=<depth>     Maximum directory search depth: 0 = only target dir, 1 = target + 1 level, etc. (default: infinite)\n";
-    echo "  --run                   Execute changes (default is dry-run / simulation)\n";
+    echo "  --max-depth=<depth>     Maximum directory search depth: 0 = only target dir, 1 = target + 1 level, etc. (default: infinite)
+  --depth-mode=<mode>     Depth search mode: up_to (up to max-depth, default) or equal (exactly at max-depth)
+  --exclude-dirs=<list>   Comma-separated list of folders to exclude (default: wp-admin,wp-includes,node_modules,vendor,.git)
+  --run                   Execute changes (default is dry-run / simulation)\n";
     echo "  --help, -h              Display this help message\n\n";
     echo color("Examples:", "1;33") . "\n";
     echo "  1. Dry-run htaccess bot blocker:\n";
@@ -74,60 +76,280 @@ function matches_template($filename, $templates) {
     return false;
 }
 
-// Find files recursively with optional maximum depth
-function find_files($dir, $templates, $max_depth = -1) {
-    if (!is_dir($dir)) {
-        return [];
-    }
-    $files = [];
-    try {
-        $it = new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS);
-        $it = new RecursiveIteratorIterator($it);
+// Expand directory lists and resolve wildcard/glob directories
+function get_expanded_target_dirs($dir_input) {
+    $raw_dirs = explode(',', $dir_input);
+    $resolved = [];
+    foreach ($raw_dirs as $raw_path) {
+        $raw_path = trim($raw_path);
+        if (empty($raw_path)) continue;
         
-        if ($max_depth !== -1 && $max_depth >= 0) {
-            $it->setMaxDepth($max_depth);
-        }
-        
-        foreach ($it as $file) {
-            if ($file->isFile()) {
-                $filename = $file->getFilename();
-                if (matches_template($filename, $templates)) {
-                    $files[] = $file->getRealPath();
+        if (strpos($raw_path, 'regex:') !== false) {
+            $base_dir = '.';
+            $pattern = '';
+            if (strpos($raw_path, '|regex:') !== false) {
+                list($base_dir, $pattern) = explode('|regex:', $raw_path, 2);
+            } else {
+                list($unused, $pattern) = explode('regex:', $raw_path, 2);
+            }
+            $base_dir = trim($base_dir);
+            $pattern = trim($pattern);
+            
+            $real_base = @realpath($base_dir);
+            if ($real_base !== false && @is_dir($real_base)) {
+                $matched = match_dirs_by_regex($real_base, $pattern);
+                foreach ($matched as $m) {
+                    $resolved[] = $m;
                 }
             }
+        } elseif (strpos($raw_path, '*') !== false || strpos($raw_path, '?') !== false) {
+            $expanded = @glob($raw_path, GLOB_ONLYDIR);
+            if ($expanded !== false && !empty($expanded)) {
+                foreach ($expanded as $dir) {
+                    $real = @realpath($dir);
+                    if ($real !== false) {
+                        $resolved[] = $real;
+                    }
+                }
+            }
+        } else {
+            $real = @realpath($raw_path);
+            if ($real !== false) {
+                $resolved[] = $real;
+            }
         }
-    } catch (Exception $e) {
-        // Silently catch exceptions like permission errors
     }
+    return array_unique($resolved);
+}
+
+// Combine a site's base directory with an optional subpath (e.g. "public_html") to get its target path
+function combine_site_path($base, $subpath) {
+    $subpath = trim(trim($subpath), '/');
+    if ($subpath === '' || $subpath === '.') {
+        return $base;
+    }
+    return $base . '/' . $subpath;
+}
+
+// List immediate subdirectories of a base path (used for the "pick a website" UI)
+function list_site_directories($base_path) {
+    $real_base = @realpath($base_path);
+    if ($real_base === false || !@is_dir($real_base)) {
+        return null;
+    }
+    $dh = @opendir($real_base);
+    if (!$dh) {
+        return null;
+    }
+    $dirs = [];
+    while (($file = readdir($dh)) !== false) {
+        if ($file === '.' || $file === '..') {
+            continue;
+        }
+        $full_path = $real_base . '/' . $file;
+        if (@is_dir($full_path)) {
+            $dirs[] = [
+                'name' => $file,
+                'path' => $full_path
+            ];
+        }
+    }
+    closedir($dh);
+    usort($dirs, function($a, $b) {
+        return strcasecmp($a['name'], $b['name']);
+    });
+    return $dirs;
+}
+
+// Find directories matching regex pattern recursively
+function match_dirs_by_regex($base_dir, $pattern) {
+    if (empty($pattern)) {
+        return [];
+    }
+    // Check if regex has delimiters (e.g. ^/ ... /i or / ... /)
+    if (preg_match('/^([~\/#]).*\1[imsuxADSUXJu]*$/', $pattern)) {
+        // Delimiters exist
+    } else {
+        // Auto-wrap in standard ~...~i delimiter to support forward slashes in path patterns without escape errors
+        $pattern = '~' . $pattern . '~i';
+    }
+    return match_dirs_by_regex_recursive($base_dir, $pattern, $base_dir);
+}
+
+function match_dirs_by_regex_recursive($dir, $pattern, $base_dir, $current_depth = 0) {
+    if ($current_depth > 5) {
+        return [];
+    }
+    $dh = @opendir($dir);
+    if (!$dh) {
+        return [];
+    }
+    $matched = [];
+    while (($file = readdir($dh)) !== false) {
+        if ($file === '.' || $file === '..') {
+            continue;
+        }
+        $full_path = $dir . '/' . $file;
+        if (@is_dir($full_path)) {
+            $real_full = @realpath($full_path);
+            $real_base = @realpath($base_dir);
+            if ($real_full !== false && $real_base !== false) {
+                $rel = substr($real_full, strlen($real_base));
+                $rel = ltrim(str_replace('\\', '/', $rel), '/');
+                if (preg_match($pattern, $rel)) {
+                    $matched[] = $real_full;
+                }
+            }
+            $sub = match_dirs_by_regex_recursive($full_path, $pattern, $base_dir, $current_depth + 1);
+            $matched = array_merge($matched, $sub);
+        }
+    }
+    closedir($dh);
+    return $matched;
+}
+
+// Check if a path is excluded based on relative path segment match
+function is_path_excluded($path, $base_dir, $exclude_dirs) {
+    if (empty($exclude_dirs)) {
+        return false;
+    }
+    $real_path = @realpath($path) ?: $path;
+    $real_base = @realpath($base_dir) ?: $base_dir;
+    
+    $rel = substr($real_path, strlen($real_base));
+    $rel = ltrim(str_replace('\\', '/', $rel), '/');
+    if ($rel === '') {
+        return false;
+    }
+    
+    $parts = explode('/', $rel);
+    foreach ($exclude_dirs as $exclude) {
+        $exclude = trim(str_replace('\\', '/', $exclude), '/');
+        if (empty($exclude)) continue;
+        
+        if ($exclude === $rel || strpos($rel, $exclude . '/') === 0 || in_array($exclude, $parts)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Helper to check recursively if a directory or its subdirectories contain any web files (like .php, .html, etc.)
+function has_web_files($dir, $exclude_dirs = []) {
+    $dh = @opendir($dir);
+    if (!$dh) {
+        return false;
+    }
+    $web_extensions = ['php', 'html', 'htm', 'shtml', 'asp', 'aspx', 'jsp', 'cgi', 'pl', 'py'];
+    while (($file = readdir($dh)) !== false) {
+        if ($file === '.' || $file === '..') {
+            continue;
+        }
+        $full_path = $dir . '/' . $file;
+        if (@is_dir($full_path)) {
+            if (!is_path_excluded($full_path, $dir, $exclude_dirs)) {
+                if (has_web_files($full_path, $exclude_dirs)) {
+                    closedir($dh);
+                    return true;
+                }
+            }
+        } else {
+            $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+            if (in_array($ext, $web_extensions)) {
+                closedir($dh);
+                return true;
+            }
+        }
+    }
+    closedir($dh);
+    return false;
+}
+
+// Find files recursively (helper)
+function find_files_recursive($dir, $templates, $max_depth, $depth_mode, $exclude_dirs, $base_dir, $current_depth = 0) {
+    if (!@is_dir($dir)) {
+        return [];
+    }
+    if (is_path_excluded($dir, $base_dir, $exclude_dirs)) {
+        return [];
+    }
+    
+    $files = [];
+    $dh = @opendir($dir);
+    if (!$dh) {
+        return [];
+    }
+    
+    while (($file = readdir($dh)) !== false) {
+        if ($file === '.' || $file === '..') {
+            continue;
+        }
+        $full_path = $dir . '/' . $file;
+        if (@is_dir($full_path)) {
+            if ($max_depth === -1 || $current_depth < $max_depth) {
+                $files = array_merge($files, find_files_recursive($full_path, $templates, $max_depth, $depth_mode, $exclude_dirs, $base_dir, $current_depth + 1));
+            }
+        } else {
+            if (matches_template($file, $templates)) {
+                if ($max_depth !== -1 && $max_depth >= 0 && $depth_mode === 'equal') {
+                    if ($current_depth !== $max_depth) {
+                        continue;
+                    }
+                }
+                $files[] = @realpath($full_path) ?: $full_path;
+            }
+        }
+    }
+    closedir($dh);
     return $files;
 }
 
-// Find directories recursively with optional maximum depth
-function find_scanned_dirs($dir, $max_depth = -1) {
-    if (!is_dir($dir)) {
+// Find files recursively with optional maximum depth
+function find_files($dir, $templates, $max_depth = -1, $depth_mode = 'up_to', $exclude_dirs = []) {
+    return find_files_recursive($dir, $templates, $max_depth, $depth_mode, $exclude_dirs, $dir, 0);
+}
+
+// Find directories recursively (helper)
+function find_scanned_dirs_recursive($dir, $max_depth, $depth_mode, $exclude_dirs, $base_dir, $current_depth = 0) {
+    if (!@is_dir($dir)) {
         return [];
     }
-    $dirs = [$dir];
-    if ($max_depth === 0) {
+    if (is_path_excluded($dir, $base_dir, $exclude_dirs)) {
+        return [];
+    }
+    
+    $dirs = [];
+    if ($max_depth === -1 || $depth_mode === 'up_to') {
+        $dirs[] = @realpath($dir) ?: $dir;
+    } else if ($depth_mode === 'equal' && $current_depth === $max_depth) {
+        $dirs[] = @realpath($dir) ?: $dir;
+    }
+    
+    if ($max_depth !== -1 && $current_depth >= $max_depth) {
         return $dirs;
     }
-    try {
-        $it = new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS);
-        $it = new RecursiveIteratorIterator($it, RecursiveIteratorIterator::SELF_FIRST);
-        
-        if ($max_depth !== -1 && $max_depth >= 0) {
-            $it->setMaxDepth($max_depth - 1);
-        }
-        
-        foreach ($it as $file) {
-            if ($file->isDir()) {
-                $dirs[] = $file->getRealPath();
-            }
-        }
-    } catch (Exception $e) {
-        // Silently catch exceptions
+    
+    $dh = @opendir($dir);
+    if (!$dh) {
+        return $dirs;
     }
+    
+    while (($file = readdir($dh)) !== false) {
+        if ($file === '.' || $file === '..') {
+            continue;
+        }
+        $full_path = $dir . '/' . $file;
+        if (@is_dir($full_path)) {
+            $dirs = array_merge($dirs, find_scanned_dirs_recursive($full_path, $max_depth, $depth_mode, $exclude_dirs, $base_dir, $current_depth + 1));
+        }
+    }
+    closedir($dh);
     return $dirs;
+}
+
+// Find directories recursively with optional maximum depth
+function find_scanned_dirs($dir, $max_depth = -1, $depth_mode = 'up_to', $exclude_dirs = []) {
+    return find_scanned_dirs_recursive($dir, $max_depth, $depth_mode, $exclude_dirs, $dir, 0);
 }
 
 // LCS-based Diff algorithm optimized with prefix/suffix trimming
@@ -294,21 +516,24 @@ function apply_replacement($content, $options) {
 
 // Gather files and execute replacements, returns data for diffs/results
 function execute_replacer($options) {
-    $target_input = $options['dir'];
-    $target_dirs = explode(',', $target_input);
+    $target_dirs = get_expanded_target_dirs($options['dir']);
+    if (empty($target_dirs)) {
+        return ['error' => "No valid target directories found matching input '{$options['dir']}'."];
+    }
+    
     $files = [];
     $resolved_dirs = [];
+
+    $exclude_input = isset($options['exclude-dirs']) ? $options['exclude-dirs'] : '';
+    $exclude_dirs = [];
+    if (!empty($exclude_input)) {
+        $exclude_dirs = explode(',', $exclude_input);
+    }
     
-    foreach ($target_dirs as $dir) {
-        $dir = trim($dir);
-        if (empty($dir)) continue;
-        if (!is_dir($dir)) {
-            return ['error' => "Target directory '{$dir}' does not exist."];
-        }
-        $real = realpath($dir);
+    foreach ($target_dirs as $real) {
         $resolved_dirs[] = $real;
         
-        $found = find_files($real, $options['template'], $options['max-depth']);
+        $found = find_files($real, $options['template'], $options['max-depth'], isset($options['depth-mode']) ? $options['depth-mode'] : 'up_to', $exclude_dirs);
         foreach ($found as $f) {
             $files[] = [
                 'absolute' => $f,
@@ -317,10 +542,13 @@ function execute_replacer($options) {
         }
         
         if ($options['mode'] === 'htaccess-bot-blocker' && matches_template('.htaccess', $options['template'])) {
-            $scanned_dirs = find_scanned_dirs($real, $options['max-depth']);
+            $scanned_dirs = find_scanned_dirs($real, $options['max-depth'], isset($options['depth-mode']) ? $options['depth-mode'] : 'up_to', $exclude_dirs);
             foreach ($scanned_dirs as $d) {
                 $htaccess_file = $d . '/.htaccess';
-                if (!file_exists($htaccess_file)) {
+                if (!@file_exists($htaccess_file)) {
+                    if (!has_web_files($d, $exclude_dirs)) {
+                        continue;
+                    }
                     $already_in = false;
                     foreach ($files as $existing) {
                         if ($existing['absolute'] === $htaccess_file) {
@@ -366,6 +594,7 @@ function execute_replacer($options) {
             if ($content === false) {
                 $results['files'][] = [
                     'path' => $display_path,
+                    'absolute' => $file,
                     'status' => 'error',
                     'message' => 'Could not read file'
                 ];
@@ -379,6 +608,7 @@ function execute_replacer($options) {
             $results['skipped_count']++;
             $results['files'][] = [
                 'path' => $display_path,
+                'absolute' => $file,
                 'status' => 'unchanged',
                 'diff' => []
             ];
@@ -428,6 +658,8 @@ if ($is_cli) {
         'replace' => '',
         'run' => false,
         'max-depth' => -1,
+        'depth-mode' => 'up_to',
+        'exclude-dirs' => 'wp-admin,wp-includes,node_modules,vendor,.git',
         'help' => false
     ];
 
@@ -448,6 +680,10 @@ if ($is_cli) {
             $options['replace'] = substr($arg, 10);
         } elseif (strpos($arg, '--max-depth=') === 0) {
             $options['max-depth'] = (int)substr($arg, 12);
+        } elseif (strpos($arg, '--depth-mode=') === 0) {
+            $options['depth-mode'] = substr($arg, 13);
+        } elseif (strpos($arg, '--exclude-dirs=') === 0) {
+            $options['exclude-dirs'] = substr($arg, 15);
         }
     }
 
@@ -467,6 +703,11 @@ if ($is_cli) {
         exit(1);
     }
 
+    if (!in_array($options['depth-mode'], ['up_to', 'equal'])) {
+        echo color("Error: Invalid depth-mode '{$options['depth-mode']}'. Allowed modes: up_to, equal.\n", "1;31");
+        exit(1);
+    }
+
     if (in_array($options['mode'], ['string', 'regex']) && empty($options['find'])) {
         echo color("Error: --find is required for mode '{$options['mode']}'.\n", "1;31");
         exit(1);
@@ -481,7 +722,8 @@ if ($is_cli) {
 
     echo color("Scanning directories: " . implode(', ', $results['target_dirs']), "1;34") . "\n";
     echo "Template filter: " . ($options['template'] ?: "* (all files)") . "\n";
-    echo "Search depth: " . ($options['max-depth'] === -1 ? "Infinite" : $options['max-depth']) . "\n";
+    echo "Search depth: " . ($options['max-depth'] === -1 ? "Infinite" : $options['max-depth']) . " (" . ($options['depth-mode'] === 'equal' ? "Exactly at depth" : "Up to depth") . ")\n";
+    echo "Excluded folders: " . ($options['exclude-dirs'] ?: "None") . "\n";
     echo "Replacement Mode: " . $options['mode'] . "\n";
     echo "Execution Mode: " . ($options['run'] ? color("LIVE RUN (Writing to files)", "1;31") : color("DRY RUN (Simulated preview)", "1;32")) . "\n\n";
 
@@ -582,6 +824,29 @@ if ($is_cli) {
         exit(0);
     }
     
+    // Handle AJAX list_sites request (browse subdirectories of a "sites root" for quick selection)
+    if (isset($_POST['action']) && $_POST['action'] === 'list_sites') {
+        while (ob_get_level()) {
+            ob_end_clean();
+        }
+        header('Content-Type: application/json');
+
+        $sites_root = isset($_POST['sites-root']) ? trim($_POST['sites-root']) : '';
+        if (empty($sites_root)) {
+            echo json_encode(['success' => false, 'error' => 'No sites root path specified.']);
+            exit(0);
+        }
+
+        $dirs = list_site_directories($sites_root);
+        if ($dirs === null) {
+            echo json_encode(['success' => false, 'error' => 'Path not found or not a directory.']);
+            exit(0);
+        }
+
+        echo json_encode(['success' => true, 'root' => realpath($sites_root), 'dirs' => $dirs]);
+        exit(0);
+    }
+
     // Handle AJAX apply_single request
     if (isset($_POST['action']) && $_POST['action'] === 'apply_single') {
         while (ob_get_level()) {
@@ -603,19 +868,20 @@ if ($is_cli) {
             'replace' => isset($_POST['replace']) ? $_POST['replace'] : '',
             'run' => true, // force write
             'max-depth' => isset($_POST['max-depth']) ? (int)$_POST['max-depth'] : -1,
+            'depth-mode' => isset($_POST['depth-mode']) ? $_POST['depth-mode'] : 'up_to',
+            'exclude-dirs' => isset($_POST['exclude-dirs']) ? $_POST['exclude-dirs'] : 'wp-admin,wp-includes,node_modules,vendor,.git',
         ];
         
-        $target_dirs = explode(',', $options['dir']);
+        $target_dirs = get_expanded_target_dirs($options['dir']);
         $is_inside = false;
         
-        $real_target_file = realpath($target_file);
+        $real_target_file = @realpath($target_file);
         if ($real_target_file === false) {
             $parent_dir = dirname($target_file);
-            $real_parent = realpath($parent_dir);
+            $real_parent = @realpath($parent_dir);
             if ($real_parent !== false) {
-                foreach ($target_dirs as $td) {
-                    $real_td = realpath(trim($td));
-                    if ($real_td !== false && strpos($real_parent, $real_td) === 0) {
+                foreach ($target_dirs as $real_td) {
+                    if (strpos($real_parent, $real_td) === 0) {
                         $is_inside = true;
                         $real_target_file = $real_parent . '/' . basename($target_file);
                         break;
@@ -623,9 +889,8 @@ if ($is_cli) {
                 }
             }
         } else {
-            foreach ($target_dirs as $td) {
-                $real_td = realpath(trim($td));
-                if ($real_td !== false && strpos($real_target_file, $real_td) === 0) {
+            foreach ($target_dirs as $real_td) {
+                if (strpos($real_target_file, $real_td) === 0) {
                     $is_inside = true;
                     break;
                 }
@@ -637,7 +902,7 @@ if ($is_cli) {
             exit(0);
         }
         
-        $is_new = !file_exists($real_target_file);
+        $is_new = !@file_exists($real_target_file);
         if ($is_new) {
             $content = '';
             if ($options['mode'] !== 'htaccess-bot-blocker' || basename($real_target_file) !== '.htaccess') {
@@ -673,8 +938,26 @@ if ($is_cli) {
         'replace' => isset($_REQUEST['replace']) ? $_REQUEST['replace'] : '',
         'run' => isset($_REQUEST['run']) && ($_REQUEST['run'] === '1' || $_REQUEST['run'] === 'on'),
         'max-depth' => isset($_REQUEST['max-depth']) ? (int)$_REQUEST['max-depth'] : -1,
+        'depth-mode' => isset($_REQUEST['depth-mode']) ? $_REQUEST['depth-mode'] : 'up_to',
+        'exclude-dirs' => isset($_REQUEST['exclude-dirs']) ? $_REQUEST['exclude-dirs'] : 'wp-admin,wp-includes,node_modules,vendor,.git',
+        'sites-root' => isset($_REQUEST['sites-root']) ? $_REQUEST['sites-root'] : '',
+        'site-subpath' => isset($_REQUEST['site-subpath']) ? $_REQUEST['site-subpath'] : '',
     ];
-    
+
+    // Resolve the "sites root" browsable directory list (lets users pick site folders instead of typing paths)
+    $site_dirs_list = [];
+    if (!empty($options['sites-root'])) {
+        $found_sites = list_site_directories($options['sites-root']);
+        if ($found_sites !== null) {
+            $site_dirs_list = $found_sites;
+        }
+    }
+    $selected_dirs = array_filter(array_map('trim', explode(',', $options['dir'])));
+    $selected_dirs = array_map(function($p) {
+        $real = @realpath($p);
+        return $real !== false ? $real : $p;
+    }, $selected_dirs);
+
     $results = null;
     $error = null;
     
@@ -1096,6 +1379,52 @@ if ($is_cli) {
                 margin-bottom: 1rem;
                 opacity: 0.5;
             }
+
+            .btn-secondary {
+                width: auto;
+                white-space: nowrap;
+                padding: 10px 16px;
+                background-color: transparent;
+                border: 1px solid var(--border);
+                color: var(--text-primary);
+            }
+
+            .btn-secondary:hover {
+                background-color: var(--bg-card-hover);
+                transform: none;
+            }
+
+            .site-list-container {
+                margin-top: 0.75rem;
+                max-height: 220px;
+                overflow-y: auto;
+                border: 1px solid var(--border);
+                border-radius: 8px;
+                padding: 0.5rem;
+                background-color: rgba(9, 13, 22, 0.3);
+            }
+
+            .site-list-item {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 6px 8px;
+                border-radius: 6px;
+                cursor: pointer;
+                font-size: 0.9rem;
+            }
+
+            .site-list-item:hover {
+                background-color: rgba(255,255,255,0.03);
+            }
+
+            .site-list-item input[type="checkbox"] {
+                width: 16px;
+                height: 16px;
+                accent-color: var(--accent);
+                cursor: pointer;
+                flex-shrink: 0;
+            }
         </style>
     </head>
     <body>
@@ -1121,9 +1450,43 @@ if ($is_cli) {
                         <?php endif; ?>
                         
                         <div class="form-group">
+                            <label for="sites-root">Sites Root (optional)</label>
+                            <div style="display: flex; gap: 8px;">
+                                <input type="text" id="sites-root" name="sites-root" value="<?= htmlspecialchars($options['sites-root']) ?>" placeholder="e.g. /var/www">
+                                <button type="button" class="btn btn-secondary" onclick="loadSites()">List Sites</button>
+                                <button type="button" class="btn btn-secondary" onclick="selectAllSites()">Select All</button>
+                            </div>
+                            <div class="help-text">Point this at a folder containing multiple website directories to pick from below, instead of typing paths by hand.</div>
+
+                            <div style="margin-top: 0.75rem;">
+                                <label for="site-subpath">Website Subpath (optional)</label>
+                                <input type="text" id="site-subpath" name="site-subpath" value="<?= htmlspecialchars($options['site-subpath']) ?>" placeholder="e.g. public_html or public_html/public" oninput="updateDirField()">
+                                <div class="help-text">Appended to each selected website's folder when building Target Directory (e.g. "public_html"). Leave blank or "." to target the website folder itself.</div>
+                            </div>
+
+                            <div id="siteListContainer" class="site-list-container">
+                                <?php if (empty($options['sites-root'])): ?>
+                                    <div class="help-text">Enter a sites root path and click "List Sites".</div>
+                                <?php elseif (empty($site_dirs_list)): ?>
+                                    <div class="help-text">No subdirectories found in this path.</div>
+                                <?php else: ?>
+                                    <?php foreach ($site_dirs_list as $sd):
+                                        $target_path = combine_site_path($sd['path'], $options['site-subpath']);
+                                        $is_checked = in_array($sd['path'], $selected_dirs, true) || in_array($target_path, $selected_dirs, true);
+                                    ?>
+                                        <label class="site-list-item">
+                                            <input type="checkbox" class="site-checkbox" data-path="<?= htmlspecialchars($sd['path']) ?>" onchange="updateDirField()" <?= $is_checked ? 'checked' : '' ?>>
+                                            <span><?= htmlspecialchars($sd['name']) ?></span>
+                                        </label>
+                                    <?php endforeach; ?>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
                             <label for="dir">Target Directory</label>
                             <input type="text" id="dir" name="dir" value="<?= htmlspecialchars($options['dir']) ?>" placeholder="e.g. ./dir1,./dir2 or /var/www/html">
-                            <div class="help-text">Absolute or relative paths to scan (comma-separated for multiple directories).</div>
+                            <div class="help-text">Absolute or relative paths to scan (comma-separated). Checking sites above adds/removes them here automatically.</div>
                         </div>
                         
                         <div class="form-group">
@@ -1133,9 +1496,25 @@ if ($is_cli) {
                         </div>
                         
                         <div class="form-group">
-                            <label for="max-depth">Search Depth</label>
-                            <input type="number" id="max-depth" name="max-depth" value="<?= (int)$options['max-depth'] ?>" min="-1" placeholder="-1">
-                            <div class="help-text">-1 = infinite recursion. 0 = scan target directory only.</div>
+                            <label for="exclude-dirs">Exclude Directories</label>
+                            <input type="text" id="exclude-dirs" name="exclude-dirs" value="<?= htmlspecialchars($options['exclude-dirs']) ?>" placeholder="e.g. wp-admin,wp-includes,node_modules,.git">
+                            <div class="help-text">Comma-separated folder names to exclude from scanning.</div>
+                        </div>
+                        
+                        <div class="form-group-row" style="display: flex; gap: 15px;">
+                            <div class="form-group" style="flex: 1;">
+                                <label for="max-depth">Search Depth</label>
+                                <input type="number" id="max-depth" name="max-depth" value="<?= (int)$options['max-depth'] ?>" min="-1" placeholder="-1">
+                                <div class="help-text">-1 = infinite recursion. 0 = scan target directory only.</div>
+                            </div>
+                            <div class="form-group" style="flex: 1;">
+                                <label for="depth-mode">Depth Mode</label>
+                                <select id="depth-mode" name="depth-mode">
+                                    <option value="up_to" <?= (!isset($options['depth-mode']) || $options['depth-mode'] === 'up_to') ? 'selected' : '' ?>>Up to Depth (&le;)</option>
+                                    <option value="equal" <?= (isset($options['depth-mode']) && $options['depth-mode'] === 'equal') ? 'selected' : '' ?>>Exactly at Depth (=)</option>
+                                </select>
+                                <div class="help-text">Scan up to max depth, or strictly at max depth.</div>
+                            </div>
                         </div>
                         
                         <div class="form-group">
@@ -1207,7 +1586,17 @@ if ($is_cli) {
                         ?>
                             <div class="file-result-card status-<?= htmlspecialchars($f['status']) ?>">
                                 <div class="file-header">
-                                    <span class="file-name"><?= htmlspecialchars($f['path']) ?></span>
+                                    <?php
+                                    $display_full = isset($f['absolute']) ? $f['absolute'] : $f['path'];
+                                    $cwd = getcwd();
+                                    if ($cwd !== false && isset($f['absolute'])) {
+                                        $real_cwd = realpath($cwd);
+                                        if ($real_cwd !== false && strpos($f['absolute'], $real_cwd) === 0) {
+                                            $display_full = '.' . substr($f['absolute'], strlen($real_cwd));
+                                        }
+                                    }
+                                    ?>
+                                    <span class="file-name" title="<?= htmlspecialchars(isset($f['absolute']) ? $f['absolute'] : $f['path']) ?>"><?= htmlspecialchars($display_full) ?></span>
                                     <div style="display: flex; align-items: center;">
                                         <?php if ($f['status'] === 'error'): ?>
                                             <span class="badge badge-unchanged" style="color: #f87171; border-color: rgba(239, 68, 68, 0.3);">Error: <?= htmlspecialchars($f['message']) ?></span>
@@ -1405,6 +1794,125 @@ if ($is_cli) {
                 });
             }
             
+            // Sites Root: browse subdirectories and let checkboxes drive the Target Directory field
+            function loadSites() {
+                var root = document.getElementById('sites-root').value.trim();
+                var container = document.getElementById('siteListContainer');
+                if (!root) {
+                    container.innerHTML = '<div class="help-text">Enter a sites root path first.</div>';
+                    return;
+                }
+                container.innerHTML = '<div class="help-text">Loading...</div>';
+
+                var formData = new FormData();
+                formData.set('action', 'list_sites');
+                formData.set('sites-root', root);
+
+                fetch(window.location.href, {
+                    method: 'POST',
+                    body: formData
+                })
+                .then(response => response.text())
+                .then(text => {
+                    var startIdx = text.indexOf('{');
+                    var endIdx = text.lastIndexOf('}');
+                    if (startIdx === -1 || endIdx === -1) {
+                        throw new Error('Invalid response from server: ' + text);
+                    }
+                    var data = JSON.parse(text.substring(startIdx, endIdx + 1));
+                    if (!data.success) {
+                        container.innerHTML = '<div class="help-text">' + escapeHtml(data.error) + '</div>';
+                        return;
+                    }
+                    renderSiteList(data.dirs);
+                })
+                .catch(error => {
+                    console.error(error);
+                    container.innerHTML = '<div class="help-text">Failed to load directory list.</div>';
+                });
+            }
+
+            function renderSiteList(dirs) {
+                var container = document.getElementById('siteListContainer');
+                if (!dirs || dirs.length === 0) {
+                    container.innerHTML = '<div class="help-text">No subdirectories found in this path.</div>';
+                    return;
+                }
+                var currentDirs = getDirFieldEntries();
+                var subpathVal = document.getElementById('site-subpath').value;
+                var html = '';
+                dirs.forEach(function(d) {
+                    var targetPath = combineSitePath(d.path, subpathVal);
+                    var checked = (currentDirs.indexOf(d.path) !== -1 || currentDirs.indexOf(targetPath) !== -1) ? 'checked' : '';
+                    html += '<label class="site-list-item">' +
+                        '<input type="checkbox" class="site-checkbox" data-path="' + escapeHtml(d.path) + '" onchange="updateDirField()" ' + checked + '>' +
+                        '<span>' + escapeHtml(d.name) + '</span>' +
+                        '</label>';
+                });
+                container.innerHTML = html;
+            }
+
+            function escapeHtml(str) {
+                var div = document.createElement('div');
+                div.textContent = str;
+                return div.innerHTML;
+            }
+
+            function getDirFieldEntries() {
+                var dirField = document.getElementById('dir');
+                return dirField.value.split(',').map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
+            }
+
+            function selectAllSites() {
+                var checkboxes = document.querySelectorAll('.site-checkbox');
+                checkboxes.forEach(function(cb) {
+                    cb.checked = true;
+                });
+                updateDirField();
+            }
+
+            function combineSitePath(base, subpath) {
+                subpath = (subpath || '').trim().replace(/^\/+|\/+$/g, '');
+                if (subpath === '' || subpath === '.') {
+                    return base;
+                }
+                return base + '/' + subpath;
+            }
+
+            function updateDirField() {
+                var dirField = document.getElementById('dir');
+                var subpathVal = document.getElementById('site-subpath').value;
+                var checkboxes = document.querySelectorAll('.site-checkbox');
+                var knownBases = [];
+                var checkedTargets = [];
+                checkboxes.forEach(function(cb) {
+                    var base = cb.getAttribute('data-path');
+                    knownBases.push(base);
+                    if (cb.checked) {
+                        checkedTargets.push(combineSitePath(base, subpathVal));
+                    }
+                });
+
+                var currentEntries = getDirFieldEntries();
+                // Keep manual entries not tied to any known site (base dir or base dir + previous subpath), then add current targets for checked ones
+                var kept = currentEntries.filter(function(e) {
+                    return !knownBases.some(function(base) {
+                        return e === base || e.indexOf(base + '/') === 0;
+                    });
+                });
+                var merged = kept.concat(checkedTargets);
+
+                var seen = {};
+                var result = [];
+                merged.forEach(function(e) {
+                    if (!seen[e]) {
+                        seen[e] = true;
+                        result.push(e);
+                    }
+                });
+                dirField.value = result.join(',');
+            }
+
             // Trigger mode fields check on load
             toggleModeFields();
         </script>
