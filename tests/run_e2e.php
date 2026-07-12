@@ -109,6 +109,47 @@ RewriteBase /
     mkdir($site6, 0777, true);
     file_put_contents("$site6/index.html", "<h1>Photo Gallery</h1>");
     
+    // -------------------------------------------------------------
+    // Site 7: Corporate Web (public_html subfolder)
+    // -------------------------------------------------------------
+    $site7 = SANDBOX_DIR . '/site7_corporate';
+    mkdir("$site7/public_html", 0777, true);
+    file_put_contents("$site7/public_html/index.php", "<?php echo 'Corporate Site Root'; ?>");
+    file_put_contents("$site7/public_html/index.html", "<h1>Corporate Website</h1>");
+
+    // -------------------------------------------------------------
+    // Site 8: Agency Portal (public_html + wp-admin subfolders)
+    // -------------------------------------------------------------
+    $site8 = SANDBOX_DIR . '/site8_agency';
+    mkdir("$site8/public_html/wp-admin", 0777, true);
+    file_put_contents("$site8/public_html/index.php", "<?php echo 'Agency Site Root'; ?>");
+    file_put_contents("$site8/public_html/wp-admin/index.php", "<?php echo 'WordPress Admin Area'; ?>");
+
+    // -------------------------------------------------------------
+    // Site 9: Static Assets (No web files, only CSS & images)
+    // -------------------------------------------------------------
+    $site9 = SANDBOX_DIR . '/site9_assets';
+    mkdir("$site9/css", 0777, true);
+    mkdir("$site9/images", 0777, true);
+    file_put_contents("$site9/css/style.css", "body { background: #000; }");
+    file_put_contents("$site9/images/photo.jpg", "binary data mock");
+
+    // -------------------------------------------------------------
+    // Site 10: biois.com (typical domain folder structure)
+    // -------------------------------------------------------------
+    $site10 = SANDBOX_DIR . '/biois.com';
+    mkdir("$site10/public_html", 0777, true);
+    file_put_contents("$site10/public_html/index.php", "<?php echo 'biois.com site root'; ?>");
+    file_put_contents("$site10/public_html/index.html", "<h1>biois.com website</h1>");
+
+    // -------------------------------------------------------------
+    // Site 11: another-domain.com (another typical domain folder structure)
+    // -------------------------------------------------------------
+    $site11 = SANDBOX_DIR . '/another-domain.com';
+    mkdir("$site11/public_html", 0777, true);
+    file_put_contents("$site11/public_html/index.php", "<?php echo 'another-domain.com site root'; ?>");
+    file_put_contents("$site11/public_html/index.html", "<h1>another-domain.com website</h1>");
+
     echo test_color("Mock websites created under: " . realpath(SANDBOX_DIR) . "\n\n", "32");
 }
 
@@ -366,6 +407,112 @@ $res_run = run_replacer([
 $contents = file_get_contents($htaccess_path);
 $replaced = (strpos($contents, 'RewriteRule ^.*$ - [F,L]') !== false);
 assert_test("Line Ending Normalization: Successfully matches multi-line search string despite CRLF/LF line ending mismatch", $replaced);
+
+// --- TEST 16: Depth Mode "Exactly at Depth" ---
+setup_sandbox();
+// Create an index.html at root (depth 0 relative to SANDBOX_DIR)
+file_put_contents(SANDBOX_DIR . '/index.html', 'Welcome to My Store at Root');
+
+// Run with max-depth=1 and depth-mode=equal.
+// site1_store/index.html (depth 1 relative to SANDBOX_DIR) should be modified.
+// SANDBOX_DIR/index.html (depth 0 relative to SANDBOX_DIR) should remain unchanged.
+$res_run = run_replacer([
+    '--dir=' . SANDBOX_DIR,
+    '--template=*.html',
+    '--mode=string',
+    '--find=Welcome to My Store',
+    '--replace=Welcome to My Shop',
+    '--max-depth=1',
+    '--depth-mode=equal',
+    '--run'
+]);
+
+$root_contents = file_get_contents(SANDBOX_DIR . '/index.html');
+$root_unchanged = (strpos($root_contents, 'Welcome to My Shop') === false);
+
+$site1_contents = file_get_contents(SANDBOX_DIR . '/site1_store/index.html');
+$site1_replaced = (strpos($site1_contents, 'Welcome to My Shop') !== false);
+
+assert_test("Depth Mode Equal: Correctly matches files exactly at the specified depth only", $root_unchanged && $site1_replaced);
+
+// --- TEST 17: Directory Exclusion ---
+setup_sandbox();
+// Run with --exclude-dirs=site1_store
+// site1_store/index.html (which matches *.html) should be completely skipped.
+$res_run = run_replacer([
+    '--dir=' . SANDBOX_DIR,
+    '--template=*.html',
+    '--mode=string',
+    '--find=Welcome to My Store',
+    '--replace=Welcome to My Shop',
+    '--exclude-dirs=site1_store',
+    '--run'
+]);
+
+$site1_contents = file_get_contents(SANDBOX_DIR . '/site1_store/index.html');
+$site1_unmodified = (strpos($site1_contents, 'Welcome to My Shop') === false);
+
+assert_test("Directory Exclusion: Completely skips traversing excluded directory lists", $site1_unmodified);
+
+// --- TEST 18: Target Directory Wildcards ---
+setup_sandbox();
+// Run with --dir=tests/sandbox/*/public_html
+// index.php files inside site7_corporate/public_html/ and site8_agency/public_html/ should be modified.
+$res_run = run_replacer([
+    '--dir=' . SANDBOX_DIR . '/*/public_html',
+    '--template=*.php',
+    '--mode=string',
+    '--find=Site Root',
+    '--replace=Site Main Page',
+    '--run'
+]);
+
+$site7_contents = file_get_contents(SANDBOX_DIR . '/site7_corporate/public_html/index.php');
+$site7_replaced = (strpos($site7_contents, 'Site Main Page') !== false);
+
+$site8_contents = file_get_contents(SANDBOX_DIR . '/site8_agency/public_html/index.php');
+$site8_replaced = (strpos($site8_contents, 'Site Main Page') !== false);
+
+assert_test("Target Directory Wildcards: Correctly expands glob patterns in target directory selection", $site7_replaced && $site8_replaced);
+
+// --- TEST 19: Conditional .htaccess Creation ---
+setup_sandbox();
+// Run .htaccess Bot Blocker on SANDBOX_DIR.
+// site9_assets/ has NO PHP/HTML files, so site9_assets/.htaccess should NOT be created.
+// site5_news/ has a PHP file, so site5_news/.htaccess SHOULD be created.
+$res_run = run_replacer([
+    '--dir=' . SANDBOX_DIR,
+    '--template=.htaccess',
+    '--mode=htaccess-bot-blocker',
+    '--run'
+]);
+
+$site9_htaccess_exists = file_exists(SANDBOX_DIR . '/site9_assets/.htaccess');
+$site5_htaccess_exists = file_exists(SANDBOX_DIR . '/site5_news/.htaccess');
+
+assert_test("Conditional .htaccess Creation: Only creates .htaccess if directory or subdirs have web pages/scripts", !$site9_htaccess_exists && $site5_htaccess_exists);
+
+// --- TEST 20: Target Directory Regex Matching ---
+setup_sandbox();
+// Run with --dir=tests/sandbox|regex:^site7_[a-z]+/public_html$
+// index.php files inside site7_corporate/public_html should be modified.
+// index.php files inside site8_agency/public_html should NOT be modified.
+$res_run = run_replacer([
+    '--dir=' . SANDBOX_DIR . '|regex:^site7_[a-z]+/public_html$',
+    '--template=*.php',
+    '--mode=string',
+    '--find=Site Root',
+    '--replace=Site Main Page',
+    '--run'
+]);
+
+$site7_contents = file_get_contents(SANDBOX_DIR . '/site7_corporate/public_html/index.php');
+$site7_replaced = (strpos($site7_contents, 'Site Main Page') !== false);
+
+$site8_contents = file_get_contents(SANDBOX_DIR . '/site8_agency/public_html/index.php');
+$site8_unmodified = (strpos($site8_contents, 'Site Main Page') === false);
+
+assert_test("Target Directory Regex Matching: Correctly resolves and limits targets using relative path regex", $site7_replaced && $site8_unmodified);
 
 // ---------------------------------------------------------
 // FINAL SUMMARY
