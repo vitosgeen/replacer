@@ -9,7 +9,7 @@
 // SECURITY CONFIGURATION
 // For safety, web interface access is restricted to localhost (127.0.0.1 or ::1) by default.
 // Change this to true ONLY if you understand the risks of allowing remote users to edit server files.
-define('ALLOW_REMOTE_ACCESS', false);
+define('ALLOW_REMOTE_ACCESS', true);
 
 // Helper function to colorize CLI output
 function color($text, $color_code) {

@@ -121,6 +121,34 @@ make test    # runs tests/run_e2e.php
 make clean   # removes tests/sandbox
 ```
 
+### Live bot-blocker check with curl
+
+`tests/run_e2e.php` only exercises the file-rewriting logic — it can't verify that the generated `.htaccess` rules actually block requests, since that requires `mod_rewrite` on a real Apache server (PHP's built-in `php -S` server ignores `.htaccess` entirely).
+
+[tests/curl_test.sh](tests/curl_test.sh) fills that gap: it sends real HTTP requests to a live URL with a chosen bot's `User-Agent`, and checks the response status.
+
+```bash
+# Single bot, expects 403
+tests/curl_test.sh --url=http://example.com/ --bot=GPTBot
+
+# Every known bot in the default blocklist
+tests/curl_test.sh --url=http://example.com/ --bot=all
+
+# A normal browser, expects 200 (confirms real visitors aren't blocked)
+tests/curl_test.sh --url=http://example.com/ --browser
+
+# Any custom User-Agent
+tests/curl_test.sh --url=http://example.com/ --ua="MyCustomBot/1.0"
+
+# List known bot names
+tests/curl_test.sh --list
+
+# Or via Makefile
+make curl-test URL=http://example.com/ BOT=GPTBot
+```
+
+Exits non-zero if any request's status doesn't match the expected code (override with `--expect=<code>`), so it can be wired into CI against a staging host.
+
 ## Security notes
 
 - The web UI's localhost-only restriction is the primary safety net for the web interface — don't disable it on an internet-facing server without another access control layer (auth, firewall, VPN) in front of it.
