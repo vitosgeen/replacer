@@ -149,6 +149,46 @@ make curl-test URL=http://example.com/ BOT=GPTBot
 
 Exits non-zero if any request's status doesn't match the expected code (override with `--expect=<code>`), so it can be wired into CI against a staging host.
 
+## Remote (FTP/SFTP) Edition
+
+[replacer_remote.php](replacer_remote.php) is a standalone sibling tool: the same search/replace engine (string, regex, prepend, append, htaccess-bot-blocker modes; glob/regex `--dir` targeting; depth limits; exclude-dirs; dry-run vs `--run`; line-level diff) applied over a remote **FTP or SFTP** connection instead of the local filesystem. Use it when you only have FTP/SFTP access to a site (typical shared hosting) rather than local or SSH shell access.
+
+### Requirements
+
+- FTP support needs only PHP's core `ftp` extension (present in most builds).
+- SFTP support uses [phpseclib](https://github.com/phpseclib/phpseclib) (pure PHP, no `ssh2` system extension required). Install it once:
+
+```bash
+composer install    # or: make composer-install
+```
+
+If `vendor/autoload.php` isn't present, FTP still works; SFTP will report a clear error telling you to run `composer install`.
+
+### CLI usage
+
+```bash
+# Dry-run over FTP
+php replacer_remote.php --protocol=ftp --host=ftp.example.com --user=bob \
+  --dir=/public_html --template=*.html,*.php --mode=string --find="old.com" --replace="new.com"
+
+# Live run over SFTP with a private key
+php replacer_remote.php --protocol=sftp --host=example.com --user=bob --key=~/.ssh/id_rsa \
+  --dir=/var/www --template=*.php --mode=regex --find='/console\.log\(.*?\);/' --replace='' --run
+
+# Password omitted → prompted interactively (hidden input), avoiding shell history/ps exposure
+php replacer_remote.php --protocol=ftp --host=ftp.example.com --user=bob --dir=/public_html --template=*.html --mode=string --find=old --replace=new
+```
+
+Connection flags: `--protocol=ftp|sftp`, `--host`, `--port`, `--user`, `--password` (or `--password-env=VARNAME`, or omit to be prompted), `--key`/`--passphrase` (SFTP public-key auth), `--ssl` (explicit FTPS), `--active` (FTP active mode instead of passive), `--timeout`. All other flags (`--dir`, `--template`, `--mode`, `--find`, `--replace`, `--max-depth`, `--depth-mode`, `--exclude-dirs`, `--run`) match replacer.php exactly. Run `php replacer_remote.php --help` for the full list.
+
+### Web UI
+
+```bash
+php -S 127.0.0.1:8081 replacer_remote.php   # or: make start-remote
+```
+
+Same dark-themed dry-run/diff/apply-single workflow as replacer.php's web UI, plus connection fields and a remote directory browser. It's a client-side (fetch-driven) single page: the form never reloads, so credentials typed in stay put between a preview scan and clicking "Apply Change" on individual files. Restricted to `127.0.0.1`/`::1` by default via the same `ALLOW_REMOTE_ACCESS` constant — since every request here also carries FTP/SFTP credentials, be extra cautious about enabling remote access.
+
 ## Security notes
 
 - The web UI's localhost-only restriction is the primary safety net for the web interface — don't disable it on an internet-facing server without another access control layer (auth, firewall, VPN) in front of it.

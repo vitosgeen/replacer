@@ -1,0 +1,8 @@
+{
+    "name": "a4media/replacer-remote",
+    "description": "Optional dependency for replacer_remote.php (SFTP support via phpseclib)",
+    "require": {
+        "php": ">=7.4",
+        "phpseclib/phpseclib": "^3.0"
+    }
+}
