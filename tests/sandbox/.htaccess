@@ -1,4 +1,0 @@
-RewriteEngine On
-RewriteCond %{HTTP_USER_AGENT} (AhrefsBot|SemrushBot|MJ12bot|DotBot|rogerbot|DataForSeoBot|BLEXBot|serpstatbot|Barkrowler|MegaIndex|GPTBot|ClaudeBot|CCBot|PerplexityBot|Bytespider|Amazonbot|meta-externalagent|Google-Extended|GoogleOther|anthropic-ai|Claude-Web) [NC]
-RewriteRule .* - [F,L]
-

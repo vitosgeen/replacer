@@ -1,0 +1,1 @@
+<?php echo 'biois.com site root'; ?>

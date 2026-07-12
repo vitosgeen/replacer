@@ -1,0 +1,1 @@
+<?php echo 'another-domain.com site root'; ?>
