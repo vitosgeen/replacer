@@ -1254,7 +1254,7 @@ if ($is_cli) {
                 padding: 2rem;
                 line-height: 1.5;
             }
-            .container { max-width: 1400px; margin: 0 auto; }
+            .container { max-width: 100%; width: 100%; margin: 0 auto; }
             header {
                 margin-bottom: 2rem;
                 display: flex;
@@ -1284,7 +1284,7 @@ if ($is_cli) {
                 border: 1px solid rgba(16, 185, 129, 0.3);
                 white-space: nowrap;
             }
-            .main-grid { display: grid; grid-template-columns: 420px 1fr; gap: 2rem; align-items: start; }
+            .main-grid { display: grid; grid-template-columns: 420px minmax(0, 1fr); gap: 2rem; align-items: start; }
             @media (max-width: 1024px) { .main-grid { grid-template-columns: 1fr; } }
             .card {
                 background-color: var(--bg-card);
@@ -1509,9 +1509,10 @@ if ($is_cli) {
                         </fieldset>
 
                         <div class="checkbox-wrapper">
-                            <input type="checkbox" name="run" id="run" value="1">
+                            <input type="checkbox" name="run" id="run" value="1" disabled>
                             <label for="run" class="checkbox-label">Apply changes (Live Run) — otherwise this is a dry-run preview</label>
                         </div>
+                        <div class="help-text" id="runHelp">Run a dry-run preview first to unlock Live Run.</div>
 
                         <button type="submit" class="btn" id="scanBtn">Scan &amp; Preview</button>
                     </form>
@@ -1532,6 +1533,26 @@ if ($is_cli) {
         const resultsContent = document.getElementById('resultsContent');
         const errorBanner = document.getElementById('errorBanner');
         const scanBtn = document.getElementById('scanBtn');
+        const runCheckbox = document.getElementById('run');
+        const runHelp = document.getElementById('runHelp');
+
+        function lockLiveRun(message) {
+            runCheckbox.checked = false;
+            runCheckbox.disabled = true;
+            runHelp.textContent = message || 'Run a dry-run preview first to unlock Live Run.';
+        }
+
+        function unlockLiveRun() {
+            runCheckbox.disabled = false;
+            runHelp.textContent = 'Preview looks good — Live Run is now available.';
+        }
+
+        form.addEventListener('input', (e) => {
+            if (e.target !== runCheckbox && !runCheckbox.disabled) lockLiveRun();
+        });
+        form.addEventListener('change', (e) => {
+            if (e.target !== runCheckbox && !runCheckbox.disabled) lockLiveRun();
+        });
 
         function escapeHtml(str) {
             return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1703,17 +1724,29 @@ if ($is_cli) {
         form.addEventListener('submit', async (e) => {
             e.preventDefault();
             clearError();
+            const isLiveRun = runCheckbox.checked && !runCheckbox.disabled;
+            if (isLiveRun) {
+                if (!confirm('Live Run is enabled — this will apply changes directly to files on the remote server. Are you sure you want to proceed?')) {
+                    return;
+                }
+            }
             scanBtn.disabled = true;
             scanBtn.textContent = 'Scanning...';
             try {
                 const connParams = connectionParams();
                 const replParams = replaceParams();
-                replParams.run = document.getElementById('run').checked ? '1' : '';
+                replParams.run = isLiveRun ? '1' : '';
                 const body = toFormBody(Object.assign({ action: 'scan' }, connParams, replParams));
                 const res = await fetch('', { method: 'POST', body });
                 const json = await res.json();
                 if (json.success) {
                     renderResults(json.results, replParams, connParams);
+                    // Every live run must be preceded by a fresh preview of the exact same parameters.
+                    if (isLiveRun) {
+                        lockLiveRun('Live Run applied — run a new preview to unlock it again.');
+                    } else {
+                        unlockLiveRun();
+                    }
                 } else {
                     showError(json.error || 'Scan failed.');
                 }
