@@ -603,28 +603,40 @@ function match_dirs_by_regex_remote($fs, $base_dir, $pattern) {
     return match_dirs_by_regex_recursive_remote($fs, $base_dir, '', $pattern, 0);
 }
 
-// Matches a single wildcard segment (the last path component) against its parent's directory listing.
+// Matches wildcard path segments (any position, not just the last) against each level's directory listing.
 function expand_remote_glob($fs, $raw_path) {
     $raw_path = rtrim($raw_path, '/');
     if ($raw_path === '') return [];
+
     $parts = explode('/', $raw_path);
-    $last = array_pop($parts);
-    $parent = implode('/', $parts);
-    if ($parent === '') $parent = '/';
+    $current_paths = [''];
 
-    if (strpos($last, '*') === false && strpos($last, '?') === false) {
-        return $fs->isDir($raw_path) ? [$raw_path] : [];
-    }
-
-    $regex = '/^' . str_replace(['\\*', '\\?'], ['.*', '.'], preg_quote($last, '/')) . '$/i';
-    $entries = $fs->listDir($parent);
-    $matches = [];
-    foreach ($entries as $entry) {
-        if ($entry['is_dir'] && preg_match($regex, $entry['name'])) {
-            $matches[] = remote_join($parent, $entry['name']);
+    foreach ($parts as $part) {
+        if ($part === '') continue;
+        $next_paths = [];
+        if (strpos($part, '*') !== false || strpos($part, '?') !== false) {
+            $regex = '/^' . str_replace(['\\*', '\\?'], ['.*', '.'], preg_quote($part, '/')) . '$/i';
+            foreach ($current_paths as $base) {
+                $entries = $fs->listDir($base === '' ? '/' : $base);
+                foreach ($entries as $entry) {
+                    if ($entry['is_dir'] && preg_match($regex, $entry['name'])) {
+                        $next_paths[] = remote_join($base, $entry['name']);
+                    }
+                }
+            }
+        } else {
+            foreach ($current_paths as $base) {
+                $next_paths[] = remote_join($base, $part);
+            }
         }
+        $current_paths = $next_paths;
     }
-    return $matches;
+
+    $matches = [];
+    foreach ($current_paths as $p) {
+        if ($fs->isDir($p)) $matches[] = $p;
+    }
+    return array_values(array_unique($matches));
 }
 
 function get_expanded_target_dirs_remote($fs, $dir_input) {
@@ -1349,7 +1361,8 @@ if ($is_cli) {
             .file-result-card.status-created { border-left: 4px solid #22d3ee; }
             .file-result-card.status-error { border-left: 4px solid #f87171; }
             .file-header { background-color: rgba(255,255,255,0.02); padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px; }
-            .file-name { font-family: ui-monospace, monospace; font-size: 0.88rem; font-weight: 500; word-break: break-all; }
+            .file-name { font-family: ui-monospace, monospace; font-size: 0.88rem; font-weight: 500; word-break: break-all; display: flex; flex-direction: column; gap: 2px; }
+            .file-path { font-size: 0.76rem; font-weight: 400; color: var(--text-secondary); }
             .badge { font-size: 0.72rem; padding: 3px 8px; border-radius: 12px; font-weight: 600; white-space: nowrap; }
             .badge-modified { background-color: rgba(251, 191, 36, 0.15); color: #fbbf24; border: 1px solid rgba(251, 191, 36, 0.3); }
             .badge-created { background-color: rgba(6, 182, 212, 0.15); color: #22d3ee; border: 1px solid rgba(6, 182, 212, 0.3); }
@@ -1438,14 +1451,17 @@ if ($is_cli) {
                         <fieldset>
                             <legend>Target</legend>
                             <div class="form-group">
-                                <label>Remote Directory (--dir)</label>
-                                <input type="text" name="dir" id="dir" value="/" placeholder="/public_html, glob, or regex:^site\d+$">
-                                <div class="browse-row" style="margin-top:0.5rem;">
-                                    <input type="text" id="browsePath" placeholder="/" value="/">
-                                    <button type="button" class="btn-secondary" id="browseBtn">Browse</button>
+                                <label>Sites Root</label>
+                                <input type="text" id="sites-root" placeholder="/home/Admin/web" oninput="updateDirField()">
+                                <div class="help-text">Remote folder containing multiple website directories, e.g. /home/Admin/web.</div>
+
+                                <div style="margin-top:0.75rem;">
+                                    <label for="site-subpath">Website Subpath</label>
+                                    <input type="text" id="site-subpath" placeholder="public_html" oninput="updateDirField()">
+                                    <div class="help-text">Appended to the site root when building the target directory (e.g. "public_html"). Leave blank or "." to target the site root itself.</div>
                                 </div>
-                                <div class="browse-list" id="browseList"></div>
                             </div>
+                            <input type="hidden" name="dir" id="dir" value="/">
                             <div class="form-group">
                                 <label>Template (comma-separated glob)</label>
                                 <input type="text" name="template" id="template" placeholder="*.html,*.php">
@@ -1521,6 +1537,13 @@ if ($is_cli) {
             return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
         }
 
+        function updateDirField() {
+            const root = document.getElementById('sites-root').value.trim().replace(/\/+$/, '');
+            if (root === '') return;
+            const subpath = document.getElementById('site-subpath').value.trim().replace(/^\/+|\/+$/g, '');
+            document.getElementById('dir').value = (subpath === '' || subpath === '.') ? root + '/*' : root + '/*/' + subpath;
+        }
+
         function connectionParams() {
             return {
                 protocol: document.getElementById('protocol').value,
@@ -1594,12 +1617,12 @@ if ($is_cli) {
             div.className = 'file-result-card status-' + f.status;
 
             if (f.status === 'error') {
-                div.innerHTML = `<div class="file-header"><span class="file-name">${escapeHtml(f.path)}</span><span class="badge" style="background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.3)">ERROR</span></div>
+                div.innerHTML = `<div class="file-header"><span class="file-name">${escapeHtml(f.path)}<span class="file-path">${escapeHtml(f.absolute)}</span></span><span class="badge" style="background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.3)">ERROR</span></div>
                     <div class="diff-viewer">${escapeHtml(f.message)}</div>`;
                 return div;
             }
             if (f.status === 'unchanged') {
-                div.innerHTML = `<div class="file-header"><span class="file-name">${escapeHtml(f.path)}</span><span class="badge badge-unchanged">UNCHANGED</span></div>`;
+                div.innerHTML = `<div class="file-header"><span class="file-name">${escapeHtml(f.path)}<span class="file-path">${escapeHtml(f.absolute)}</span></span><span class="badge badge-unchanged">UNCHANGED</span></div>`;
                 return div;
             }
 
@@ -1615,7 +1638,7 @@ if ($is_cli) {
             const applyBtn = wasRun ? '' : `<button class="btn-apply-single" data-file="${escapeHtml(f.absolute)}">Apply Change</button>`;
 
             div.innerHTML = `<div class="file-header">
-                    <span class="file-name">${escapeHtml(f.path)}</span>
+                    <span class="file-name">${escapeHtml(f.path)}<span class="file-path">${escapeHtml(f.absolute)}</span></span>
                     <span>${statusBadge}${applyBtn}</span>
                 </div>
                 <div class="diff-viewer">${renderDiff(f.diff)}</div>`;
@@ -1702,38 +1725,6 @@ if ($is_cli) {
             }
         });
 
-        document.getElementById('browseBtn').addEventListener('click', async () => {
-            clearError();
-            const list = document.getElementById('browseList');
-            const path = document.getElementById('browsePath').value || '/';
-            try {
-                const body = toFormBody(Object.assign({ action: 'list_dir', path }, connectionParams()));
-                const res = await fetch('', { method: 'POST', body });
-                const json = await res.json();
-                if (!json.success) {
-                    showError(json.error || 'Browse failed.');
-                    return;
-                }
-                list.innerHTML = '';
-                list.style.display = 'block';
-                if (json.dirs.length === 0) {
-                    list.innerHTML = '<div class="browse-item" style="cursor:default;color:var(--text-secondary)">(no subdirectories)</div>';
-                }
-                json.dirs.forEach(name => {
-                    const item = document.createElement('div');
-                    item.className = 'browse-item';
-                    item.textContent = name;
-                    item.addEventListener('click', () => {
-                        const full = (json.path === '/' ? '' : json.path) + '/' + name;
-                        document.getElementById('browsePath').value = full;
-                        document.getElementById('dir').value = full;
-                    });
-                    list.appendChild(item);
-                });
-            } catch (e) {
-                showError('Network error browsing: ' + e.message);
-            }
-        });
         </script>
     </body>
     </html>
