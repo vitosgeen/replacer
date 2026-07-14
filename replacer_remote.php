@@ -15,6 +15,11 @@
 // host running the script is itself trusted/firewalled (matches the ALLOW_REMOTE_ACCESS convention in replacer.php).
 define('ALLOW_REMOTE_ACCESS', true);
 
+// Before any live write, the pre-change contents of a remote file are saved here (on the machine
+// running this script), under <host>_<port>/<run-id>/<original-remote-path>. Nothing is ever
+// written back to the remote server itself.
+define('BACKUP_DIR', __DIR__ . '/backups');
+
 $autoload = __DIR__ . '/vendor/autoload.php';
 if (file_exists($autoload)) {
     require $autoload;
@@ -171,6 +176,52 @@ function get_diff($old_lines, $new_lines) {
     }
 
     return array_merge($prefix, $mid_diff, $suffix);
+}
+
+// Generates one shared id per run so every file touched by the same live-run/apply
+// lands under the same backup folder.
+function new_backup_run_id() {
+    return date('Ymd_His') . '_' . substr(bin2hex(random_bytes(3)), 0, 6);
+}
+
+// Path (relative to BACKUP_DIR) where a given remote file's backup lives for a given run.
+// Drops any '.', '..' or empty path segments so this can never resolve outside BACKUP_DIR.
+function backup_relative_path($host, $port, $run_id, $absolute_remote_path) {
+    $host_safe = preg_replace('/[^A-Za-z0-9._-]/', '_', $host);
+    $segments = explode('/', str_replace('\\', '/', $absolute_remote_path));
+    $clean = [];
+    foreach ($segments as $seg) {
+        if ($seg === '' || $seg === '.' || $seg === '..') continue;
+        $clean[] = $seg;
+    }
+    return $host_safe . '_' . $port . '/' . $run_id . '/' . implode('/', $clean);
+}
+
+// Saves the pre-change file contents locally, before a remote file gets overwritten.
+// Returns the local backup path on success, or false on failure.
+function backup_local_copy($host, $port, $run_id, $absolute_remote_path, $content) {
+    $full_path = BACKUP_DIR . '/' . backup_relative_path($host, $port, $run_id, $absolute_remote_path);
+
+    $dir = dirname($full_path);
+    if (!is_dir($dir) && !mkdir($dir, 0755, true) && !is_dir($dir)) {
+        return false;
+    }
+    if (file_put_contents($full_path, $content) === false) {
+        return false;
+    }
+    return $full_path;
+}
+
+// Locates a previously-saved backup for restore. Returns the real local path, or false if
+// it doesn't exist (or would resolve outside BACKUP_DIR).
+function find_backup_copy($host, $port, $run_id, $absolute_remote_path) {
+    $full_path = BACKUP_DIR . '/' . backup_relative_path($host, $port, $run_id, $absolute_remote_path);
+    $backup_root = realpath(BACKUP_DIR);
+    $real_path = realpath($full_path);
+    if ($backup_root === false || $real_path === false || strpos($real_path, $backup_root . DIRECTORY_SEPARATOR) !== 0) {
+        return false;
+    }
+    return is_file($real_path) ? $real_path : false;
 }
 
 // Perform replacement based on mode (identical semantics to replacer.php)
@@ -730,6 +781,14 @@ function execute_replacer_remote($fs, $options) {
 
     $is_multi_dir = count($target_dirs) > 1;
 
+    $run_id = null;
+    $backup_port = $options['port'] ?: ($options['protocol'] === 'sftp' ? 22 : 21);
+    if ($options['run']) {
+        $run_id = new_backup_run_id();
+        $results['backup_run_id'] = $run_id;
+        $results['backup_dir'] = BACKUP_DIR . '/' . preg_replace('/[^A-Za-z0-9._-]/', '_', $options['host']) . '_' . $backup_port . '/' . $run_id;
+    }
+
     foreach ($files as $fileData) {
         $file = $fileData['absolute'];
         $base_dir = $fileData['base_dir'];
@@ -773,7 +832,23 @@ function execute_replacer_remote($fs, $options) {
         $diff = get_diff($old_lines, $new_lines);
 
         $write_success = true;
+        $backup_path = null;
         if ($options['run']) {
+            if (!$is_new) {
+                $backup_path = backup_local_copy($options['host'], $backup_port, $run_id, $file, $content);
+                if ($backup_path === false) {
+                    $write_success = false;
+                    $results['files'][] = [
+                        'path' => $display_path,
+                        'absolute' => $file,
+                        'status' => $is_new ? 'created' : 'modified',
+                        'write_success' => false,
+                        'backup_error' => true,
+                        'diff' => $diff,
+                    ];
+                    continue;
+                }
+            }
             if (!$fs->putContents($file, $new_content)) {
                 $write_success = false;
             }
@@ -784,6 +859,7 @@ function execute_replacer_remote($fs, $options) {
             'absolute' => $file,
             'status' => $is_new ? 'created' : 'modified',
             'write_success' => $write_success,
+            'backup_path' => $backup_path ?: null,
             'diff' => $diff,
         ];
     }
@@ -945,7 +1021,11 @@ if ($is_cli) {
     echo "Search depth: " . ($options['max-depth'] === -1 ? "Infinite" : $options['max-depth']) . " (" . ($options['depth-mode'] === 'equal' ? "Exactly at depth" : "Up to depth") . ")\n";
     echo "Excluded folders: " . ($options['exclude-dirs'] ?: "None") . "\n";
     echo "Replacement Mode: " . $options['mode'] . "\n";
-    echo "Execution Mode: " . ($options['run'] ? color("LIVE RUN (Writing to remote files)", "1;31") : color("DRY RUN (Simulated preview)", "1;32")) . "\n\n";
+    echo "Execution Mode: " . ($options['run'] ? color("LIVE RUN (Writing to remote files)", "1;31") : color("DRY RUN (Simulated preview)", "1;32")) . "\n";
+    if ($options['run'] && isset($results['backup_dir'])) {
+        echo "Backups (pre-change originals) saved to: " . color($results['backup_dir'], "1;36") . "\n";
+    }
+    echo "\n";
 
     echo "Found " . color($results['total_files'], "1;33") . " matching file(s).\n\n";
 
@@ -990,7 +1070,9 @@ if ($is_cli) {
             print_cli_diff($fileData['diff']);
             echo "\n";
             if ($options['run']) {
-                if ($fileData['write_success']) {
+                if (!empty($fileData['backup_error'])) {
+                    echo color("[ERROR] Backup failed, write skipped for: {$fileData['path']}\n\n", "1;31");
+                } elseif ($fileData['write_success']) {
                     echo color("[SUCCESS] Applied changes to: {$fileData['path']}\n\n", "1;32");
                 } else {
                     echo color("[ERROR] Failed writing to: {$fileData['path']}\n\n", "1;31");
@@ -1174,6 +1256,19 @@ if ($is_cli) {
 
         $new_content = apply_replacement($content, $options);
 
+        $backup_path = null;
+        $backup_run_id = null;
+        if (!$is_new) {
+            $backup_port = $cfg['port'] ?: ($cfg['protocol'] === 'sftp' ? 22 : 21);
+            $backup_run_id = new_backup_run_id();
+            $backup_path = backup_local_copy($cfg['host'], $backup_port, $backup_run_id, $target_file, $content);
+            if ($backup_path === false) {
+                $fs->disconnect();
+                echo json_encode(['success' => false, 'error' => 'Failed to save a local backup before writing; aborted without touching the remote file.']);
+                exit(0);
+            }
+        }
+
         if (!$fs->putContents($target_file, $new_content)) {
             $err = $fs->lastError();
             $fs->disconnect();
@@ -1182,7 +1277,79 @@ if ($is_cli) {
         }
 
         $fs->disconnect();
-        echo json_encode(['success' => true]);
+        echo json_encode(['success' => true, 'backup_path' => $backup_path, 'backup_run_id' => $backup_run_id]);
+        exit(0);
+    }
+
+    if ($action === 'restore_backup') {
+        while (ob_get_level()) ob_end_clean();
+        header('Content-Type: application/json');
+
+        $cfg = build_connection_config($_POST);
+        $target_file = isset($_POST['file']) ? remote_normalize($_POST['file']) : '';
+        $run_id = $_POST['run_id'] ?? '';
+        $dir = $_POST['dir'] ?? '/';
+
+        if ($target_file === '' || $target_file === '/') {
+            echo json_encode(['success' => false, 'error' => 'No target file specified.']);
+            exit(0);
+        }
+        if (!preg_match('/^\d{8}_\d{6}_[0-9a-f]{6}$/', $run_id)) {
+            echo json_encode(['success' => false, 'error' => 'Invalid or missing backup reference.']);
+            exit(0);
+        }
+
+        $fs = make_remote_fs($cfg['protocol']);
+        if (!$fs->connect($cfg)) {
+            echo json_encode(['success' => false, 'error' => 'Connection failed: ' . $fs->lastError()]);
+            exit(0);
+        }
+
+        $target_dirs = get_expanded_target_dirs_remote($fs, $dir);
+        $is_inside = false;
+        foreach ($target_dirs as $td) {
+            $td_norm = rtrim(remote_normalize($td), '/') . '/';
+            if (strpos($target_file . '/', $td_norm) === 0) {
+                $is_inside = true;
+                break;
+            }
+        }
+        if (!$is_inside) {
+            $fs->disconnect();
+            echo json_encode(['success' => false, 'error' => 'Access Denied: Target file is outside targeted directories.']);
+            exit(0);
+        }
+
+        $backup_port = $cfg['port'] ?: ($cfg['protocol'] === 'sftp' ? 22 : 21);
+        $backup_file = find_backup_copy($cfg['host'], $backup_port, $run_id, $target_file);
+        if ($backup_file === false) {
+            $fs->disconnect();
+            echo json_encode(['success' => false, 'error' => 'No backup found for this file and run.']);
+            exit(0);
+        }
+        $backup_content = file_get_contents($backup_file);
+        if ($backup_content === false) {
+            $fs->disconnect();
+            echo json_encode(['success' => false, 'error' => 'Could not read the backup file.']);
+            exit(0);
+        }
+
+        // Restoring is itself an overwrite, so snapshot the file's current (edited) state first.
+        $pre_restore_backup_path = null;
+        $current_content = $fs->getContents($target_file);
+        if ($current_content !== false) {
+            $pre_restore_backup_path = backup_local_copy($cfg['host'], $backup_port, new_backup_run_id(), $target_file, $current_content);
+        }
+
+        if (!$fs->putContents($target_file, $backup_content)) {
+            $err = $fs->lastError();
+            $fs->disconnect();
+            echo json_encode(['success' => false, 'error' => 'Failed to write restored content to remote file: ' . $err]);
+            exit(0);
+        }
+
+        $fs->disconnect();
+        echo json_encode(['success' => true, 'pre_restore_backup_path' => $pre_restore_backup_path ?: null]);
         exit(0);
     }
 
@@ -1374,6 +1541,12 @@ if ($is_cli) {
             }
             .btn-apply-single:hover { background-color: var(--accent-hover); }
             .btn-apply-single:disabled { background-color: var(--border); color: var(--text-secondary); cursor: not-allowed; opacity: 0.5; }
+            .btn-restore {
+                background-color: transparent; color: #fbbf24; border: 1px solid rgba(251, 191, 36, 0.4); padding: 4px 10px; border-radius: 4px;
+                font-size: 0.72rem; font-weight: 600; cursor: pointer; margin-left: 6px;
+            }
+            .btn-restore:hover { background-color: rgba(251, 191, 36, 0.1); }
+            .btn-restore:disabled { color: var(--text-secondary); border-color: var(--border); cursor: not-allowed; opacity: 0.5; }
             .diff-viewer { font-family: ui-monospace, monospace; font-size: 0.82rem; overflow-x: auto; background-color: #060910; padding: 1rem; white-space: pre; line-height: 1.6; }
             .diff-line { display: block; padding: 2px 6px; border-radius: 4px; min-height: 1.4em; }
             .diff-add { background-color: var(--diff-add-bg); color: var(--diff-add-text); }
@@ -1633,7 +1806,41 @@ if ($is_cli) {
             return html;
         }
 
-        function fileCard(f, connParams, replParams) {
+        function addRestoreButton(div, f, connParams, replParams, backupPath, runId) {
+            const holder = div.querySelector('.file-header > span:last-child');
+            holder.insertAdjacentHTML('beforeend', `<button class="btn-restore" data-run-id="${escapeHtml(runId)}">Restore Backup</button>`);
+            const restoreBtn = holder.querySelector('.btn-restore');
+            restoreBtn.addEventListener('click', async () => {
+                if (!confirm('Restore this file from its backup? The remote file\'s current contents will be overwritten (a fresh safety copy of the current state is taken first).')) {
+                    return;
+                }
+                restoreBtn.disabled = true;
+                restoreBtn.textContent = 'Restoring...';
+                try {
+                    const body = toFormBody(Object.assign({ action: 'restore_backup', file: f.absolute, run_id: runId, dir: replParams.dir }, connParams));
+                    const res = await fetch('', { method: 'POST', body });
+                    const json = await res.json();
+                    if (json.success) {
+                        restoreBtn.disabled = false;
+                        restoreBtn.textContent = 'Restore Backup';
+                        holder.insertAdjacentHTML('beforeend', '<span class="badge badge-success">RESTORED</span>');
+                        if (json.pre_restore_backup_path) {
+                            div.querySelector('.file-name').insertAdjacentHTML('beforeend', `<div class="file-path" style="margin-top:4px">Pre-restore snapshot: ${escapeHtml(json.pre_restore_backup_path)}</div>`);
+                        }
+                    } else {
+                        restoreBtn.disabled = false;
+                        restoreBtn.textContent = 'Restore Backup';
+                        showError(json.error || 'Failed to restore backup.');
+                    }
+                } catch (e) {
+                    restoreBtn.disabled = false;
+                    restoreBtn.textContent = 'Restore Backup';
+                    showError('Network error restoring backup: ' + e.message);
+                }
+            });
+        }
+
+        function fileCard(f, connParams, replParams, runId) {
             const div = document.createElement('div');
             div.className = 'file-result-card status-' + f.status;
 
@@ -1651,18 +1858,27 @@ if ($is_cli) {
             const wasRun = replParams.run === '1';
             let statusBadge = `<span class="badge ${badgeClass}">${f.status.toUpperCase()}</span>`;
             if (wasRun) {
-                statusBadge += f.write_success
-                    ? '<span class="badge badge-success">WRITTEN</span>'
-                    : '<span class="badge" style="background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.3)">WRITE FAILED</span>';
+                if (f.backup_error) {
+                    statusBadge += '<span class="badge" style="background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.3)">BACKUP FAILED</span>';
+                } else {
+                    statusBadge += f.write_success
+                        ? '<span class="badge badge-success">WRITTEN</span>'
+                        : '<span class="badge" style="background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.3)">WRITE FAILED</span>';
+                }
             }
 
             const applyBtn = wasRun ? '' : `<button class="btn-apply-single" data-file="${escapeHtml(f.absolute)}">Apply Change</button>`;
+            const backupNote = (wasRun && f.backup_path) ? `<div class="file-path" style="margin-top:4px">Backup: ${escapeHtml(f.backup_path)}</div>` : '';
 
             div.innerHTML = `<div class="file-header">
-                    <span class="file-name">${escapeHtml(f.path)}<span class="file-path">${escapeHtml(f.absolute)}</span></span>
+                    <span class="file-name">${escapeHtml(f.path)}<span class="file-path">${escapeHtml(f.absolute)}</span>${backupNote}</span>
                     <span>${statusBadge}${applyBtn}</span>
                 </div>
                 <div class="diff-viewer">${renderDiff(f.diff)}</div>`;
+
+            if (wasRun && f.write_success && f.backup_path && runId) {
+                addRestoreButton(div, f, connParams, replParams, f.backup_path, runId);
+            }
 
             const btn = div.querySelector('.btn-apply-single');
             if (btn) {
@@ -1676,6 +1892,12 @@ if ($is_cli) {
                         if (json.success) {
                             btn.remove();
                             div.querySelector('.file-header > span:last-child').insertAdjacentHTML('beforeend', '<span class="badge badge-success">WRITTEN</span>');
+                            if (json.backup_path) {
+                                div.querySelector('.file-name').insertAdjacentHTML('beforeend', `<div class="file-path" style="margin-top:4px">Backup: ${escapeHtml(json.backup_path)}</div>`);
+                            }
+                            if (json.backup_path && json.backup_run_id) {
+                                addRestoreButton(div, f, connParams, replParams, json.backup_path, json.backup_run_id);
+                            }
                         } else {
                             btn.disabled = false;
                             btn.textContent = 'Apply Change';
@@ -1710,6 +1932,14 @@ if ($is_cli) {
                 <div class="summary-item"><div class="summary-num gray">${results.skipped_count}</div><div class="summary-label">Unchanged</div></div>`;
             resultsContent.appendChild(summary);
 
+            if (results.backup_dir) {
+                const note = document.createElement('div');
+                note.className = 'help-text';
+                note.style.marginBottom = '1rem';
+                note.textContent = 'Originals backed up to: ' + results.backup_dir;
+                resultsContent.appendChild(note);
+            }
+
             const relevant = results.files.filter(f => f.status !== 'unchanged');
             if (relevant.length === 0) {
                 const p = document.createElement('div');
@@ -1717,7 +1947,7 @@ if ($is_cli) {
                 p.textContent = 'No files needed changes.';
                 resultsContent.appendChild(p);
             } else {
-                relevant.forEach(f => resultsContent.appendChild(fileCard(f, connParams, replParams)));
+                relevant.forEach(f => resultsContent.appendChild(fileCard(f, connParams, replParams, results.backup_run_id)));
             }
         }
 
